@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 from allauth.mfa import signals
 from allauth.mfa.adapter import get_adapter as get_mfa_adapter
@@ -37,6 +38,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.viewsets import ModelViewSet
 
+from documents.models import PaperlessTask
 from documents.permissions import PaperlessObjectPermissions
 from documents.tasks import llmindex_index
 from paperless.filters import GroupFilterSet
@@ -89,7 +91,7 @@ class StandardPagination(PageNumberPagination):
 
         query = self.page.paginator.object_list
         if isinstance(query, TantivyRelevanceList):
-            return [h["id"] for h in query._hits]
+            return query.get_all_ids()
         return self.page.paginator.object_list.values_list("pk", flat=True)
 
     def get_paginated_response_schema(self, schema):
@@ -114,7 +116,7 @@ class FaviconView(View):
             return HttpResponseNotFound("favicon.ico not found")
 
 
-class UserViewSet(ModelViewSet):
+class UserViewSet(ModelViewSet[User]):
     _BOOL_NOT_PROVIDED = object()
     model = User
 
@@ -216,7 +218,7 @@ class UserViewSet(ModelViewSet):
             return HttpResponseNotFound("TOTP not found")
 
 
-class GroupViewSet(ModelViewSet):
+class GroupViewSet(ModelViewSet[Group]):
     model = Group
 
     queryset = Group.objects.order_by(Lower("name"))
@@ -229,7 +231,7 @@ class GroupViewSet(ModelViewSet):
     ordering_fields = ("name",)
 
 
-class ProfileView(GenericAPIView):
+class ProfileView(GenericAPIView[Any]):
     """
     User profile view, only available when logged in
     """
@@ -288,7 +290,7 @@ class ProfileView(GenericAPIView):
         },
     ),
 )
-class TOTPView(GenericAPIView):
+class TOTPView(GenericAPIView[Any]):
     """
     TOTP views
     """
@@ -368,7 +370,7 @@ class TOTPView(GenericAPIView):
         },
     ),
 )
-class GenerateAuthTokenView(GenericAPIView):
+class GenerateAuthTokenView(GenericAPIView[Any]):
     """
     Generates (or re-generates) an auth token, requires a logged in user
     unlike the default DRF endpoint
@@ -397,7 +399,7 @@ class GenerateAuthTokenView(GenericAPIView):
         },
     ),
 )
-class ApplicationConfigurationViewSet(ModelViewSet):
+class ApplicationConfigurationViewSet(ModelViewSet[ApplicationConfiguration]):
     model = ApplicationConfiguration
 
     queryset = ApplicationConfiguration.objects
@@ -426,10 +428,9 @@ class ApplicationConfigurationViewSet(ModelViewSet):
             and not vector_store_file_exists()
         ):
             # AI index was just enabled and vector store file does not exist
-            llmindex_index.delay(
-                rebuild=True,
-                scheduled=False,
-                auto=True,
+            llmindex_index.apply_async(
+                kwargs={"rebuild": True},
+                headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
             )
 
 
@@ -450,7 +451,7 @@ class ApplicationConfigurationViewSet(ModelViewSet):
         },
     ),
 )
-class DisconnectSocialAccountView(GenericAPIView):
+class DisconnectSocialAccountView(GenericAPIView[Any]):
     """
     Disconnects a social account provider from the user account
     """
@@ -476,7 +477,7 @@ class DisconnectSocialAccountView(GenericAPIView):
         },
     ),
 )
-class SocialAccountProvidersView(GenericAPIView):
+class SocialAccountProvidersView(GenericAPIView[Any]):
     """
     List of social account providers
     """

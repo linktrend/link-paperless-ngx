@@ -18,6 +18,7 @@ from django.contrib.auth.models import Permission
 from django.contrib.auth.models import User
 from django.core import mail
 from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import DataError
 from django.test import override_settings
 from django.utils import timezone
@@ -46,11 +47,11 @@ from documents.models import Workflow
 from documents.models import WorkflowAction
 from documents.models import WorkflowTrigger
 from documents.signals.handlers import run_workflows
+from documents.tests.utils import ConsumeTaskMixin
 from documents.tests.utils import DirectoriesMixin
-from documents.tests.utils import DocumentConsumeDelayMixin
 
 
-class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
+class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
     def setUp(self) -> None:
         super().setUp()
 
@@ -1167,6 +1168,43 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertIn("all", response.data)
         self.assertCountEqual(response.data["all"], [d.id for d in docs])
 
+    def test_default_ordering_uses_id_as_tiebreaker(self):
+        """
+        GIVEN:
+            - Documents sharing the same created date
+        WHEN:
+            - API request for documents without an explicit ordering
+        THEN:
+            - Results are correctly ordered by created > id
+        """
+        older_doc = Document.objects.create(
+            checksum="older",
+            content="older",
+            created=date(2024, 1, 1),
+        )
+        first_same_date_doc = Document.objects.create(
+            checksum="same-date-1",
+            content="same-date-1",
+            created=date(2024, 1, 2),
+        )
+        second_same_date_doc = Document.objects.create(
+            checksum="same-date-2",
+            content="same-date-2",
+            created=date(2024, 1, 2),
+        )
+
+        response = self.client.get("/api/documents/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [result["id"] for result in response.data["results"]],
+            [
+                second_same_date_doc.id,
+                first_same_date_doc.id,
+                older_doc.id,
+            ],
+        )
+
     def test_list_with_include_selection_data(self) -> None:
         correspondent = Correspondent.objects.create(name="c1")
         doc_type = DocumentType.objects.create(name="dt1")
@@ -1314,6 +1352,41 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["documents_inbox"], 0)
 
+    def test_statistics_with_statistics_permission(self) -> None:
+        owner = User.objects.create_user("owner")
+        stats_user = User.objects.create_user("stats-user")
+        stats_user.user_permissions.add(
+            Permission.objects.get(codename="view_global_statistics"),
+        )
+
+        inbox_tag = Tag.objects.create(
+            name="stats_inbox",
+            is_inbox_tag=True,
+            owner=owner,
+        )
+        Document.objects.create(
+            title="owned-doc",
+            checksum="stats-A",
+            mime_type="application/pdf",
+            content="abcdef",
+            owner=owner,
+        ).tags.add(inbox_tag)
+        Correspondent.objects.create(name="stats-correspondent", owner=owner)
+        DocumentType.objects.create(name="stats-type", owner=owner)
+        StoragePath.objects.create(name="stats-path", path="archive", owner=owner)
+
+        self.client.force_authenticate(user=stats_user)
+        response = self.client.get("/api/statistics/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["documents_total"], 1)
+        self.assertEqual(response.data["documents_inbox"], 1)
+        self.assertEqual(response.data["inbox_tags"], [inbox_tag.pk])
+        self.assertEqual(response.data["character_count"], 6)
+        self.assertEqual(response.data["correspondent_count"], 1)
+        self.assertEqual(response.data["document_type_count"], 1)
+        self.assertEqual(response.data["storage_path_count"], 1)
+
     def test_upload(self) -> None:
         self.consume_file_mock.return_value = celery.result.AsyncResult(
             id=str(uuid.uuid4()),
@@ -1327,9 +1400,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertTrue(
@@ -1341,6 +1412,75 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertIsNone(overrides.correspondent_id)
         self.assertIsNone(overrides.document_type_id)
         self.assertIsNone(overrides.tag_ids)
+
+    def test_upload_with_path_traversal_filename_is_reduced_to_basename(self) -> None:
+        self.consume_file_mock.return_value = celery.result.AsyncResult(
+            id=str(uuid.uuid4()),
+        )
+
+        payload = SimpleUploadedFile(
+            "../../outside.pdf",
+            (Path(__file__).parent / "samples" / "simple.pdf").read_bytes(),
+            content_type="application/pdf",
+        )
+
+        response = self.client.post(
+            "/api/documents/post_document/",
+            {"document": payload},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
+
+        self.assertEqual(input_doc.original_file.name, "outside.pdf")
+        self.assertEqual(overrides.filename, "outside.pdf")
+        self.assertNotIn("..", input_doc.original_file.name)
+        self.assertNotIn("..", overrides.filename)
+        self.assertTrue(
+            input_doc.original_file.resolve(strict=False).is_relative_to(
+                Path(settings.SCRATCH_DIR).resolve(strict=False),
+            ),
+        )
+
+    def test_upload_with_path_traversal_content_disposition_filename_is_reduced_to_basename(
+        self,
+    ) -> None:
+        self.consume_file_mock.return_value = celery.result.AsyncResult(
+            id=str(uuid.uuid4()),
+        )
+
+        pdf_bytes = (Path(__file__).parent / "samples" / "simple.pdf").read_bytes()
+        boundary = "paperless-boundary"
+        payload = (
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="document"; '
+                'filename="../../outside.pdf"\r\n'
+                "Content-Type: application/pdf\r\n\r\n"
+            ).encode()
+            + pdf_bytes
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+
+        response = self.client.generic(
+            "POST",
+            "/api/documents/post_document/",
+            payload,
+            content_type=f"multipart/form-data; boundary={boundary}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
+
+        self.assertEqual(input_doc.original_file.name, "outside.pdf")
+        self.assertEqual(overrides.filename, "outside.pdf")
+        self.assertNotIn("..", input_doc.original_file.name)
+        self.assertNotIn("..", overrides.filename)
+        self.assertTrue(
+            input_doc.original_file.resolve(strict=False).is_relative_to(
+                Path(settings.SCRATCH_DIR).resolve(strict=False),
+            ),
+        )
 
     def test_document_filters_use_latest_version_content(self) -> None:
         root = Document.objects.create(
@@ -1412,9 +1552,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertTrue(
@@ -1466,9 +1604,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.title, "my custom title")
         self.assertIsNone(overrides.correspondent_id)
@@ -1488,9 +1624,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.correspondent_id, c.id)
         self.assertIsNone(overrides.title)
@@ -1524,9 +1658,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.document_type_id, dt.id)
         self.assertIsNone(overrides.correspondent_id)
@@ -1560,9 +1692,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.storage_path_id, sp.id)
         self.assertIsNone(overrides.correspondent_id)
@@ -1597,9 +1727,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertCountEqual(overrides.tag_ids, [t1.id, t2.id])
         self.assertIsNone(overrides.document_type_id)
@@ -1644,9 +1772,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.created, created.date())
 
@@ -1663,9 +1789,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertEqual(overrides.filename, "simple.pdf")
@@ -1695,9 +1819,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertEqual(overrides.filename, "simple.pdf")
@@ -1752,9 +1874,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         new_overrides, _ = run_workflows(
             trigger_type=WorkflowTrigger.WorkflowTriggerType.CONSUMPTION,
@@ -1800,9 +1920,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertEqual(overrides.filename, "simple.pdf")
@@ -1901,9 +2019,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, _ = self.get_last_consume_delay_call_args()
+        input_doc, _ = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.source, WorkflowTrigger.DocumentSourceChoices.WEB_UI)
 
@@ -3000,6 +3116,77 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         # modified was updated to today
         self.assertEqual(doc.modified.day, timezone.now().day)
 
+    def test_delete_note_missing_id(self) -> None:
+        """
+        GIVEN:
+            - Existing document
+        WHEN:
+            - API DELETE request to notes endpoint without an id query param
+            - API DELETE request to notes endpoint with an empty id query param
+        THEN:
+            - HTTP 400 is returned
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document",
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id=",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_note_invalid_id(self) -> None:
+        """
+        GIVEN:
+            - Existing document
+        WHEN:
+            - API DELETE request to notes endpoint with a non-integer note id
+        THEN:
+            - HTTP 400 is returned
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document",
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id=notaninteger",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_note_nonexistent_id(self) -> None:
+        """
+        GIVEN:
+            - Existing document, no notes
+        WHEN:
+            - API DELETE request to notes endpoint with a non-existent note id
+        THEN:
+            - HTTP 404 is returned
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document",
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id=99999",
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
     def test_get_notes_no_doc(self) -> None:
         """
         GIVEN:
@@ -3270,7 +3457,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED)
         self.assertEqual(create_resp.data["document"], doc.pk)
 
-    def test_next_asn(self) -> None:
+    def test_next_asn(self):
         """
         GIVEN:
             - Existing documents with ASNs, highest owned by user2

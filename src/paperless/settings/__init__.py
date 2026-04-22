@@ -133,7 +133,6 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework.authtoken",
     "django_filters",
-    "django_celery_results",
     "guardian",
     "allauth",
     "allauth.account",
@@ -669,8 +668,6 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT: Final[int] = get_int_from_env("PAPERLESS_WORKER_TIMEOUT", 1800)
 
-CELERY_RESULT_EXTENDED = True
-CELERY_RESULT_BACKEND = "django-db"
 CELERY_CACHE_BACKEND = "default"
 
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#task-serializer
@@ -889,10 +886,23 @@ OCR_LANGUAGE = os.getenv("PAPERLESS_OCR_LANGUAGE", "eng")
 # OCRmyPDF --output-type options are available.
 OCR_OUTPUT_TYPE = os.getenv("PAPERLESS_OCR_OUTPUT_TYPE", "pdfa")
 
-# skip. redo, force
-OCR_MODE = os.getenv("PAPERLESS_OCR_MODE", "skip")
+if os.environ.get("PAPERLESS_OCR_MODE", "") in (
+    "skip",
+    "skip_noarchive",
+):  # pragma: no cover
+    OCR_MODE = "auto"
+else:
+    OCR_MODE = get_choice_from_env(
+        "PAPERLESS_OCR_MODE",
+        {"auto", "force", "redo", "off"},
+        default="auto",
+    )
 
-OCR_SKIP_ARCHIVE_FILE = os.getenv("PAPERLESS_OCR_SKIP_ARCHIVE_FILE", "never")
+ARCHIVE_FILE_GENERATION = get_choice_from_env(
+    "PAPERLESS_ARCHIVE_FILE_GENERATION",
+    {"auto", "always", "never"},
+    default="auto",
+)
 
 OCR_IMAGE_DPI = get_int_from_env("PAPERLESS_OCR_IMAGE_DPI")
 

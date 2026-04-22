@@ -278,7 +278,7 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         doc.refresh_from_db()
         self.assertEqual(doc.custom_fields.first().value, None)
 
-    @mock.patch("documents.signals.handlers.process_cf_select_update.delay")
+    @mock.patch("documents.signals.handlers.process_cf_select_update.apply_async")
     def test_custom_field_update_offloaded_once(self, mock_delay) -> None:
         """
         GIVEN:
@@ -322,7 +322,7 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         }
         cf_select.save()
 
-        mock_delay.assert_called_once_with(cf_select)
+        mock_delay.assert_called_once_with(kwargs={"custom_field": cf_select})
 
     def test_create_custom_field_monetary_validation(self) -> None:
         """
@@ -1309,7 +1309,7 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         # Test as user without access to the document
         non_superuser = User.objects.create_user(username="non_superuser")
         non_superuser.user_permissions.add(
-            *Permission.objects.all(),
+            *Permission.objects.exclude(codename="view_global_statistics"),
         )
         non_superuser.save()
         self.client.force_authenticate(user=non_superuser)
@@ -1320,3 +1320,41 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         results = response.data["results"]
         self.assertEqual(results[0]["document_count"], 0)
+
+    def test_patch_document_invalid_date_custom_field_returns_validation_error(self):
+        """
+        GIVEN:
+            - A date custom field
+            - A document
+        WHEN:
+            - Patching the document with a date string in the wrong format
+        THEN:
+            - HTTP 400 is returned instead of an internal server error
+            - No custom field instance is created
+        """
+        cf_date = CustomField.objects.create(
+            name="datefield",
+            data_type=CustomField.FieldDataType.DATE,
+        )
+        doc = Document.objects.create(
+            title="Doc",
+            checksum="123",
+            mime_type="application/pdf",
+        )
+
+        response = self.client.patch(
+            f"/api/documents/{doc.pk}/",
+            {
+                "custom_fields": [
+                    {
+                        "field": cf_date.pk,
+                        "value": "10.03.2026",
+                    },
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("custom_fields", response.data)
+        self.assertEqual(CustomFieldInstance.objects.count(), 0)

@@ -10,7 +10,6 @@ is an identity function that adds no overhead.
 """
 
 import logging
-import uuid
 from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
@@ -18,12 +17,9 @@ from typing import TYPE_CHECKING
 from typing import Final
 from typing import TypedDict
 
-from celery import states
 from django.conf import settings
-from django.utils import timezone
 
 from documents.models import Document
-from documents.models import PaperlessTask
 from documents.utils import IterWrapper
 from documents.utils import compute_checksum
 from documents.utils import identity
@@ -182,8 +178,9 @@ def _check_thumbnail(
     present_files: set[Path],
 ) -> None:
     """Verify the thumbnail exists and is readable."""
-    thumbnail_path: Final[Path] = Path(doc.thumbnail_path).resolve()
-    if not thumbnail_path.exists() or not thumbnail_path.is_file():
+    # doc.thumbnail_path already returns a resolved Path; no need to re-resolve.
+    thumbnail_path: Final[Path] = doc.thumbnail_path
+    if not thumbnail_path.is_file():
         messages.error(doc.pk, "Thumbnail of document does not exist.")
         return
 
@@ -200,8 +197,9 @@ def _check_original(
     present_files: set[Path],
 ) -> None:
     """Verify the original file exists, is readable, and has matching checksum."""
-    source_path: Final[Path] = Path(doc.source_path).resolve()
-    if not source_path.exists() or not source_path.is_file():
+    # doc.source_path already returns a resolved Path; no need to re-resolve.
+    source_path: Final[Path] = doc.source_path
+    if not source_path.is_file():
         messages.error(doc.pk, "Original of document does not exist.")
         return
 
@@ -237,8 +235,9 @@ def _check_archive(
     elif doc.has_archive_version:
         if TYPE_CHECKING:
             assert isinstance(doc.archive_path, Path)
-        archive_path: Final[Path] = Path(doc.archive_path).resolve()
-        if not archive_path.exists() or not archive_path.is_file():
+        # doc.archive_path already returns a resolved Path; no need to re-resolve.
+        archive_path: Final[Path] = doc.archive_path  # type: ignore[assignment]
+        if not archive_path.is_file():
             messages.error(doc.pk, "Archived version of document does not exist.")
             return
 
@@ -284,59 +283,33 @@ def _check_document(
 
 def check_sanity(
     *,
-    scheduled: bool = True,
     iter_wrapper: IterWrapper[Document] = identity,
 ) -> SanityCheckMessages:
     """Run a full sanity check on the document archive.
 
     Args:
-        scheduled: Whether this is a scheduled (automatic) or manual check.
-            Controls the task type recorded in the database.
         iter_wrapper: A callable that wraps the document iterable, e.g.,
             for progress bar display. Defaults to identity (no wrapping).
 
     Returns:
         A SanityCheckMessages instance containing all detected issues.
     """
-    paperless_task = PaperlessTask.objects.create(
-        task_id=uuid.uuid4(),
-        type=(
-            PaperlessTask.TaskType.SCHEDULED_TASK
-            if scheduled
-            else PaperlessTask.TaskType.MANUAL_TASK
-        ),
-        task_name=PaperlessTask.TaskName.CHECK_SANITY,
-        status=states.STARTED,
-        date_created=timezone.now(),
-        date_started=timezone.now(),
-    )
-
     messages = SanityCheckMessages()
     present_files = _build_present_files()
 
-    documents = Document.global_objects.all()
+    documents = Document.global_objects.only(
+        "pk",
+        "filename",
+        "mime_type",
+        "checksum",
+        "archive_checksum",
+        "archive_filename",
+        "content",
+    ).iterator(chunk_size=500)
     for doc in iter_wrapper(documents):
         _check_document(doc, messages, present_files)
 
     for extra_file in present_files:
         messages.warning(None, f"Orphaned file in media dir: {extra_file}")
-
-    paperless_task.status = states.SUCCESS if not messages.has_error else states.FAILURE
-    if messages.total_issue_count == 0:
-        paperless_task.result = "No issues found."
-    else:
-        parts: list[str] = []
-        if messages.document_error_count:
-            parts.append(f"{messages.document_error_count} document(s) with errors")
-        if messages.document_warning_count:
-            parts.append(f"{messages.document_warning_count} document(s) with warnings")
-        if messages.global_warning_count:
-            parts.append(f"{messages.global_warning_count} global warning(s)")
-        paperless_task.result = ", ".join(parts) + " found."
-        if messages.has_error:
-            paperless_task.result += " Check logs for details."
-
-    paperless_task.date_done = timezone.now()
-    paperless_task.save(update_fields=["status", "result", "date_done"])
 
     return messages

@@ -1,4 +1,5 @@
 import datetime
+import logging
 import os
 import shutil
 import tempfile
@@ -19,6 +20,7 @@ from rest_framework.reverse import reverse
 
 from documents.classifier import load_classifier
 from documents.data_models import ConsumableDocument
+from documents.data_models import ConsumeFileSuccessResult
 from documents.data_models import DocumentMetadataOverrides
 from documents.file_handling import create_source_path_directory
 from documents.file_handling import generate_filename
@@ -50,9 +52,14 @@ from documents.utils import compute_checksum
 from documents.utils import copy_basic_file_stats
 from documents.utils import copy_file_with_basic_stats
 from documents.utils import run_subprocess
+from paperless.config import OcrConfig
+from paperless.models import ArchiveFileGenerationChoices
 from paperless.parsers import ParserContext
 from paperless.parsers import ParserProtocol
 from paperless.parsers.registry import get_parser_registry
+from paperless.parsers.utils import PDF_TEXT_MIN_LENGTH
+from paperless.parsers.utils import extract_pdf_text
+from paperless.parsers.utils import is_tagged_pdf
 
 LOGGING_NAME: Final[str] = "paperless.consumer"
 
@@ -84,6 +91,15 @@ class ConsumerError(Exception):
     pass
 
 
+class ConsumeFileDuplicateError(ConsumerError):
+    """Raised when a file is rejected because it duplicates an existing document."""
+
+    def __init__(self, message: str, duplicate_id: int, *, in_trash: bool) -> None:
+        super().__init__(message)
+        self.duplicate_id = duplicate_id
+        self.in_trash = in_trash
+
+
 class ConsumerStatusShortMessage(StrEnum):
     DOCUMENT_ALREADY_EXISTS = "document_already_exists"
     DOCUMENT_ALREADY_EXISTS_IN_TRASH = "document_already_exists_in_trash"
@@ -103,6 +119,74 @@ class ConsumerStatusShortMessage(StrEnum):
     SAVE_DOCUMENT = "save_document"
     FINISHED = "finished"
     FAILED = "failed"
+
+
+def should_produce_archive(
+    parser: "ParserProtocol",
+    mime_type: str,
+    document_path: Path,
+    log: logging.Logger | None = None,
+) -> bool:
+    """Return True if a PDF/A archive should be produced for this document.
+
+    IMPORTANT: *parser* must be an instantiated parser, not the class.
+    ``requires_pdf_rendition`` and ``can_produce_archive`` are instance
+    ``@property`` methods — accessing them on the class returns the descriptor
+    (always truthy).
+    """
+    _log = log or logging.getLogger(LOGGING_NAME)
+
+    # Must produce a PDF so the frontend can display the original format at all.
+    if parser.requires_pdf_rendition:
+        _log.debug("Archive: yes — parser requires PDF rendition for frontend display")
+        return True
+
+    # Parser cannot produce an archive (e.g. TextDocumentParser).
+    if not parser.can_produce_archive:
+        _log.debug("Archive: no — parser cannot produce archives")
+        return False
+
+    generation = OcrConfig().archive_file_generation
+
+    if generation == ArchiveFileGenerationChoices.ALWAYS:
+        _log.debug("Archive: yes — ARCHIVE_FILE_GENERATION=always")
+        return True
+    if generation == ArchiveFileGenerationChoices.NEVER:
+        _log.debug("Archive: no — ARCHIVE_FILE_GENERATION=never")
+        return False
+
+    # auto: produce archives for scanned/image documents; skip for born-digital PDFs.
+    if mime_type.startswith("image/"):
+        _log.debug("Archive: yes — image document, ARCHIVE_FILE_GENERATION=auto")
+        return True
+    if mime_type == "application/pdf":
+        if is_tagged_pdf(document_path):
+            _log.debug(
+                "Archive: no — born-digital PDF (structure tags detected),"
+                " ARCHIVE_FILE_GENERATION=auto",
+            )
+            return False
+        text = extract_pdf_text(document_path)
+        if text is None or len(text) <= PDF_TEXT_MIN_LENGTH:
+            _log.debug(
+                "Archive: yes — scanned PDF (text_length=%d ≤ %d),"
+                " ARCHIVE_FILE_GENERATION=auto",
+                len(text) if text else 0,
+                PDF_TEXT_MIN_LENGTH,
+            )
+            return True
+        _log.debug(
+            "Archive: no — born-digital PDF (text_length=%d > %d),"
+            " ARCHIVE_FILE_GENERATION=auto",
+            len(text),
+            PDF_TEXT_MIN_LENGTH,
+        )
+        return False
+    _log.debug(
+        "Archive: no — MIME type %r not eligible for auto archive generation",
+        mime_type,
+    )
+    return False
 
 
 class ConsumerPluginMixin:
@@ -239,7 +323,6 @@ class ConsumerPlugin(
             run_subprocess(
                 [
                     settings.PRE_CONSUME_SCRIPT,
-                    original_file_path,
                 ],
                 script_env,
                 self.log,
@@ -309,14 +392,6 @@ class ConsumerPlugin(
             run_subprocess(
                 [
                     settings.POST_CONSUME_SCRIPT,
-                    str(document.pk),
-                    document.get_public_filename(),
-                    os.path.normpath(document.source_path),
-                    os.path.normpath(document.thumbnail_path),
-                    reverse("document-download", kwargs={"pk": document.pk}),
-                    reverse("document-thumb", kwargs={"pk": document.pk}),
-                    str(document.correspondent),
-                    str(",".join(document.tags.all().values_list("name", flat=True))),
                 ],
                 script_env,
                 self.log,
@@ -330,7 +405,7 @@ class ConsumerPlugin(
                 exception=e,
             )
 
-    def run(self) -> str:
+    def run(self) -> "ConsumeFileSuccessResult":
         """
         Return the document object if it was successfully created.
         """
@@ -436,7 +511,17 @@ class ConsumerPlugin(
                     )
                     self.log.debug(f"Parsing {self.filename}...")
 
-                    document_parser.parse(self.working_copy, mime_type)
+                    produce_archive = should_produce_archive(
+                        document_parser,
+                        mime_type,
+                        self.working_copy,
+                        self.log,
+                    )
+                    document_parser.parse(
+                        self.working_copy,
+                        mime_type,
+                        produce_archive=produce_archive,
+                    )
 
                     self.log.debug(f"Generating thumbnail for {self.filename}...")
                     self._send_progress(
@@ -566,6 +651,10 @@ class ConsumerPlugin(
                         # If we get here, it was successful. Proceed with post-consume
                         # hooks. If they fail, nothing will get changed.
 
+                        document = Document.objects.prefetch_related("versions").get(
+                            pk=document.pk,
+                        )
+
                         document_consumption_finished.send(
                             sender=self.__class__,
                             document=document,
@@ -692,7 +781,7 @@ class ConsumerPlugin(
         # Return the most up to date fields
         document.refresh_from_db()
 
-        return f"Success. New document id {document.pk} created"
+        return ConsumeFileSuccessResult(document_id=document.pk)
 
     def _parse_title_placeholders(self, title: str) -> str:
         local_added = timezone.localtime(timezone.now())
@@ -785,7 +874,7 @@ class ConsumerPlugin(
 
         return document
 
-    def apply_overrides(self, document) -> None:
+    def apply_overrides(self, document: Document) -> None:
         if self.metadata.correspondent_id:
             document.correspondent = Correspondent.objects.get(
                 pk=self.metadata.correspondent_id,
@@ -931,9 +1020,13 @@ class ConsumerPreflightPlugin(
                     )
                     failure_msg += " Note: existing document is in the trash."
 
-                self._fail(
-                    status_msg,
-                    failure_msg,
+                self._send_progress(100, 100, ProgressStatusOptions.FAILED, status_msg)
+                self.log.error(failure_msg)
+                in_trash = duplicates_in_trash.exists()
+                raise ConsumeFileDuplicateError(
+                    f"{self.filename}: {failure_msg}",
+                    duplicate.pk,
+                    in_trash=in_trash,
                 )
 
     def pre_check_directories(self) -> None:
