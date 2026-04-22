@@ -10,7 +10,6 @@ from tempfile import mkstemp
 
 from celery import Task
 from celery import shared_task
-from celery import states
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
@@ -27,10 +26,15 @@ from documents.caching import clear_document_caches
 from documents.classifier import DocumentClassifier
 from documents.classifier import load_classifier
 from documents.consumer import AsnCheckPlugin
+from documents.consumer import ConsumeFileDuplicateError
 from documents.consumer import ConsumerPlugin
 from documents.consumer import ConsumerPreflightPlugin
 from documents.consumer import WorkflowTriggerPlugin
+from documents.consumer import should_produce_archive
 from documents.data_models import ConsumableDocument
+from documents.data_models import ConsumeFileDuplicateResult
+from documents.data_models import ConsumeFileStoppedResult
+from documents.data_models import ConsumeFileSuccessResult
 from documents.data_models import DocumentMetadataOverrides
 from documents.double_sided import CollatePlugin
 from documents.file_handling import create_source_path_directory
@@ -83,19 +87,8 @@ def index_optimize() -> None:
 @shared_task
 def train_classifier(
     *,
-    scheduled=True,
     status_callback: Callable[[str], None] | None = None,
-) -> None:
-    task = PaperlessTask.objects.create(
-        type=PaperlessTask.TaskType.SCHEDULED_TASK
-        if scheduled
-        else PaperlessTask.TaskType.MANUAL_TASK,
-        task_id=uuid.uuid4(),
-        task_name=PaperlessTask.TaskName.TRAIN_CLASSIFIER,
-        status=states.STARTED,
-        date_created=timezone.now(),
-        date_started=timezone.now(),
-    )
+) -> str:
     if (
         not Tag.objects.filter(matching_algorithm=Tag.MATCH_AUTO).exists()
         and not DocumentType.objects.filter(matching_algorithm=Tag.MATCH_AUTO).exists()
@@ -106,40 +99,25 @@ def train_classifier(
         logger.info(result)
         # Special case, items were once auto and trained, so remove the model
         # and prevent its use again
-        if settings.MODEL_FILE.exists():
+        if settings.MODEL_FILE.exists():  # pragma: no cover
             logger.info(f"Removing {settings.MODEL_FILE} so it won't be used")
             settings.MODEL_FILE.unlink()
-        task.status = states.SUCCESS
-        task.result = result
-        task.date_done = timezone.now()
-        task.save()
-        return
+        return result
 
     classifier = load_classifier()
 
     if not classifier:
         classifier = DocumentClassifier()
 
-    try:
-        if classifier.train(status_callback=status_callback):
-            logger.info(
-                f"Saving updated classifier model to {settings.MODEL_FILE}...",
-            )
-            classifier.save()
-            task.result = "Training completed successfully"
-        else:
-            logger.debug("Training data unchanged.")
-            task.result = "Training data unchanged"
-
-        task.status = states.SUCCESS
-
-    except Exception as e:
-        logger.warning("Classifier error: " + str(e))
-        task.status = states.FAILURE
-        task.result = str(e)
-
-    task.date_done = timezone.now()
-    task.save(update_fields=["status", "result", "date_done"])
+    if classifier.train(status_callback=status_callback):
+        logger.info(
+            f"Saving updated classifier model to {settings.MODEL_FILE}...",
+        )
+        classifier.save()
+        return "Training completed successfully"
+    else:
+        logger.debug("Training data unchanged.")
+        return "Training data unchanged"
 
 
 @shared_task(bind=True)
@@ -147,6 +125,11 @@ def consume_file(
     self: Task,
     input_doc: ConsumableDocument,
     overrides: DocumentMetadataOverrides | None = None,
+) -> (
+    ConsumeFileSuccessResult
+    | ConsumeFileStoppedResult
+    | ConsumeFileDuplicateResult
+    | None
 ):
     token = consume_task_id.set((self.request.id or "")[:8])
     try:
@@ -179,6 +162,7 @@ def consume_file(
             TemporaryDirectory(dir=settings.SCRATCH_DIR) as tmp_dir,
         ):
             tmp_dir = Path(tmp_dir)
+            msg = None
             for plugin_class in plugins:
                 plugin_name = plugin_class.NAME
 
@@ -209,7 +193,14 @@ def consume_file(
 
                 except StopConsumeTaskError as e:
                     logger.info(f"{plugin_name} requested task exit: {e.message}")
-                    return e.message
+                    return ConsumeFileStoppedResult(reason=e.message)
+
+                except ConsumeFileDuplicateError as e:
+                    logger.info(f"{plugin_name} rejected duplicate: {e}")
+                    return ConsumeFileDuplicateResult(
+                        duplicate_of=e.duplicate_id,
+                        duplicate_in_trash=e.in_trash,
+                    )
 
                 except Exception as e:
                     logger.exception(f"{plugin_name} failed: {e}")
@@ -230,8 +221,8 @@ def consume_file(
 
 
 @shared_task
-def sanity_check(*, scheduled=True, raise_on_error=True):
-    messages = sanity_checker.check_sanity(scheduled=scheduled)
+def sanity_check(*, raise_on_error: bool = True) -> str:
+    messages = sanity_checker.check_sanity()
     messages.log_messages()
 
     if not messages.has_error and not messages.has_warning and not messages.has_info:
@@ -311,7 +302,16 @@ def update_document_content_maybe_archive_file(document_id) -> None:
         parser.configure(ParserContext())
 
         try:
-            parser.parse(document.source_path, mime_type)
+            produce_archive = should_produce_archive(
+                parser,
+                mime_type,
+                document.source_path,
+            )
+            parser.parse(
+                document.source_path,
+                mime_type,
+                produce_archive=produce_archive,
+            )
 
             thumbnail = parser.get_thumbnail(document.source_path, mime_type)
 
@@ -618,49 +618,29 @@ def update_document_parent_tags(tag: Tag, new_parent: Tag) -> None:
         )
 
     if affected:
-        bulk_update_documents.delay(document_ids=list(affected))
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": list(affected)},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
 
 
 @shared_task
 def llmindex_index(
     *,
     iter_wrapper: IterWrapper[Document] = identity,
-    rebuild=False,
-    scheduled=True,
-    auto=False,
-) -> None:
+    rebuild: bool = False,
+) -> str | None:
     ai_config = AIConfig()
-    if ai_config.llm_index_enabled:
-        task = PaperlessTask.objects.create(
-            type=PaperlessTask.TaskType.SCHEDULED_TASK
-            if scheduled
-            else PaperlessTask.TaskType.AUTO
-            if auto
-            else PaperlessTask.TaskType.MANUAL_TASK,
-            task_id=uuid.uuid4(),
-            task_name=PaperlessTask.TaskName.LLMINDEX_UPDATE,
-            status=states.STARTED,
-            date_created=timezone.now(),
-            date_started=timezone.now(),
-        )
-        from paperless_ai.indexing import update_llm_index
-
-        try:
-            result = update_llm_index(
-                iter_wrapper=iter_wrapper,
-                rebuild=rebuild,
-            )
-            task.status = states.SUCCESS
-            task.result = result
-        except Exception as e:
-            logger.error("LLM index error: " + str(e))
-            task.status = states.FAILURE
-            task.result = str(e)
-
-        task.date_done = timezone.now()
-        task.save(update_fields=["status", "result", "date_done"])
-    else:
+    if not ai_config.llm_index_enabled:  # pragma: no cover
         logger.info("LLM index is disabled, skipping update.")
+        return None
+
+    from paperless_ai.indexing import update_llm_index
+
+    return update_llm_index(
+        iter_wrapper=iter_wrapper,
+        rebuild=rebuild,
+    )
 
 
 @shared_task

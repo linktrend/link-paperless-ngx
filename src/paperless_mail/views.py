@@ -1,6 +1,8 @@
 import datetime
 import logging
 from datetime import timedelta
+from http import HTTPStatus
+from typing import Any
 
 from django.http import HttpResponseBadRequest
 from django.http import HttpResponseForbidden
@@ -22,6 +24,7 @@ from rest_framework.viewsets import ModelViewSet
 from rest_framework.viewsets import ReadOnlyModelViewSet
 
 from documents.filters import ObjectOwnedOrGrantedPermissionsFilter
+from documents.models import PaperlessTask
 from documents.permissions import PaperlessObjectPermissions
 from documents.permissions import has_perms_owner_aware
 from documents.views import PassUserMixin
@@ -65,7 +68,7 @@ from paperless_mail.tasks import process_mail_accounts
         },
     ),
 )
-class MailAccountViewSet(ModelViewSet, PassUserMixin):
+class MailAccountViewSet(PassUserMixin, ModelViewSet[MailAccount]):
     model = MailAccount
 
     queryset = MailAccount.objects.all().order_by("pk")
@@ -154,12 +157,40 @@ class MailAccountViewSet(ModelViewSet, PassUserMixin):
     @action(methods=["post"], detail=True)
     def process(self, request, pk=None):
         account = self.get_object()
-        process_mail_accounts.delay([account.pk])
+        process_mail_accounts.apply_async(
+            kwargs={"account_ids": [account.pk]},
+            headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
+        )
 
         return Response({"result": "OK"})
 
 
-class ProcessedMailViewSet(ReadOnlyModelViewSet, PassUserMixin):
+@extend_schema_view(
+    bulk_delete=extend_schema(
+        operation_id="processed_mail_bulk_delete",
+        description="Delete multiple processed mail records by ID.",
+        request=inline_serializer(
+            name="BulkDeleteMailRequest",
+            fields={
+                "mail_ids": serializers.ListField(child=serializers.IntegerField()),
+            },
+        ),
+        responses={
+            (HTTPStatus.OK, "application/json"): inline_serializer(
+                name="BulkDeleteMailResponse",
+                fields={
+                    "result": serializers.CharField(),
+                    "deleted_mail_ids": serializers.ListField(
+                        child=serializers.IntegerField(),
+                    ),
+                },
+            ),
+            HTTPStatus.BAD_REQUEST: None,
+            HTTPStatus.FORBIDDEN: None,
+        },
+    ),
+)
+class ProcessedMailViewSet(PassUserMixin, ReadOnlyModelViewSet[ProcessedMail]):
     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
     serializer_class = ProcessedMailSerializer
     pagination_class = StandardPagination
@@ -187,7 +218,7 @@ class ProcessedMailViewSet(ReadOnlyModelViewSet, PassUserMixin):
         return Response({"result": "OK", "deleted_mail_ids": mail_ids})
 
 
-class MailRuleViewSet(ModelViewSet, PassUserMixin):
+class MailRuleViewSet(PassUserMixin, ModelViewSet[MailRule]):
     model = MailRule
 
     queryset = MailRule.objects.all().order_by("order")
@@ -203,7 +234,7 @@ class MailRuleViewSet(ModelViewSet, PassUserMixin):
         responses={200: None},
     ),
 )
-class OauthCallbackView(GenericAPIView):
+class OauthCallbackView(GenericAPIView[Any]):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request, format=None):

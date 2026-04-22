@@ -27,7 +27,10 @@ sample_file: Path = Path(__file__).parent / "samples" / "simple.pdf"
 
 
 @pytest.mark.management
-@override_settings(FILENAME_FORMAT="{correspondent}/{title}")
+@override_settings(
+    FILENAME_FORMAT="{correspondent}/{title}",
+    ARCHIVE_FILE_GENERATION="always",
+)
 class TestArchiver(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
     def make_models(self):
         return Document.objects.create(
@@ -208,7 +211,7 @@ class TestCreateClassifier:
 
         call_command("document_create_classifier", skip_checks=True)
 
-        m.assert_called_once_with(scheduled=False, status_callback=mocker.ANY)
+        m.assert_called_once_with(status_callback=mocker.ANY)
         assert callable(m.call_args.kwargs["status_callback"])
 
     def test_create_classifier_callback_output(self, mocker: MockerFixture) -> None:

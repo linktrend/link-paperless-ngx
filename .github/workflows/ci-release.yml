@@ -10,10 +10,14 @@ concurrency:
 env:
   DEFAULT_UV_VERSION: "0.10.x"
   DEFAULT_PYTHON_VERSION: "3.12"
+permissions: {}
 jobs:
   wait-for-docker:
     name: Wait for Docker Build
     runs-on: ubuntu-24.04
+    permissions:
+      checks: read
+      statuses: read
     steps:
       - name: Wait for Docker build
         uses: lewagon/wait-on-check-action@74049309dfeff245fe8009a0137eacf28136cb3c # v1.5.0
@@ -26,9 +30,13 @@ jobs:
     name: Build Release
     needs: wait-for-docker
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       # ---- Frontend Build ----
       - name: Install pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
@@ -38,8 +46,7 @@ jobs:
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: 24.x
-          cache: 'pnpm'
-          cache-dependency-path: 'src-ui/pnpm-lock.yaml'
+          package-manager-cache: false
       - name: Install frontend dependencies
         run: cd src-ui && pnpm install
       - name: Build frontend
@@ -51,23 +58,27 @@ jobs:
         with:
           python-version: ${{ env.DEFAULT_PYTHON_VERSION }}
       - name: Install uv
-        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
         with:
           version: ${{ env.DEFAULT_UV_VERSION }}
-          enable-cache: true
+          enable-cache: false
           python-version: ${{ steps.setup-python.outputs.python-version }}
       - name: Install Python dependencies
+        env:
+          PYTHON_VERSION: ${{ steps.setup-python.outputs.python-version }}
         run: |
-          uv sync --python ${{ steps.setup-python.outputs.python-version }} --dev --frozen
+          uv sync --python "${PYTHON_VERSION}" --dev --frozen
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -qq --no-install-recommends gettext liblept5
       # ---- Build Documentation ----
       - name: Build documentation
+        env:
+          PYTHON_VERSION: ${{ steps.setup-python.outputs.python-version }}
         run: |
           uv run \
-            --python ${{ steps.setup-python.outputs.python-version }} \
+            --python "${PYTHON_VERSION}" \
             --dev \
             --frozen \
             zensical build --clean
@@ -76,16 +87,22 @@ jobs:
         run: |
           uv export --quiet --no-dev --all-extras --format requirements-txt --output-file requirements.txt
       - name: Compile messages
+        env:
+          PAPERLESS_SECRET_KEY: "ci-release-not-a-real-secret"
+          PYTHON_VERSION: ${{ steps.setup-python.outputs.python-version }}
         run: |
           cd src/
           uv run \
-            --python ${{ steps.setup-python.outputs.python-version }} \
+            --python "${PYTHON_VERSION}" \
             manage.py compilemessages
       - name: Collect static files
+        env:
+          PAPERLESS_SECRET_KEY: "ci-release-not-a-real-secret"
+          PYTHON_VERSION: ${{ steps.setup-python.outputs.python-version }}
         run: |
           cd src/
           uv run \
-            --python ${{ steps.setup-python.outputs.python-version }} \
+            --python "${PYTHON_VERSION}" \
             manage.py collectstatic --no-input --clear
       - name: Assemble release package
         run: |
@@ -127,6 +144,9 @@ jobs:
     name: Publish Release
     needs: build-release
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       prerelease: ${{ steps.get-version.outputs.prerelease }}
       changelog: ${{ steps.create-release.outputs.body }}
@@ -139,9 +159,11 @@ jobs:
           path: ./
       - name: Get version info
         id: get-version
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          if [[ "${{ github.ref_name }}" == *"-beta.rc"* ]]; then
+          echo "version=${REF_NAME}" >> $GITHUB_OUTPUT
+          if [[ "${REF_NAME}" == *"-beta.rc"* ]]; then
             echo "prerelease=true" >> $GITHUB_OUTPUT
           else
             echo "prerelease=false" >> $GITHUB_OUTPUT
@@ -174,29 +196,39 @@ jobs:
     needs: publish-release
     if: needs.publish-release.outputs.prerelease == 'false'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: main
+          persist-credentials: true # for pushing changelog branch
       - name: Set up Python
         id: setup-python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ env.DEFAULT_PYTHON_VERSION }}
       - name: Install uv
-        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
         with:
           version: ${{ env.DEFAULT_UV_VERSION }}
-          enable-cache: true
+          enable-cache: false
           python-version: ${{ env.DEFAULT_PYTHON_VERSION }}
       - name: Update changelog
         working-directory: docs
+        env:
+          CHANGELOG: ${{ needs.publish-release.outputs.changelog }}
+          PYTHON_VERSION: ${{ steps.setup-python.outputs.python-version }}
+          VERSION: ${{ needs.publish-release.outputs.version }}
         run: |
-          git branch ${{ needs.publish-release.outputs.version }}-changelog
-          git checkout ${{ needs.publish-release.outputs.version }}-changelog
+          branch_name="${VERSION}-changelog"
 
-          echo -e "# Changelog\n\n${{ needs.publish-release.outputs.changelog }}\n" > changelog-new.md
+          git branch "${branch_name}"
+          git checkout "${branch_name}"
+
+          printf '# Changelog\n\n%s\n' "${CHANGELOG}" > changelog-new.md
 
           echo "Manually linking usernames"
           sed -i -r 's|@([a-zA-Z0-9_]+) \(\[#|[@\1](https://github.com/\1) ([#|g' changelog-new.md
@@ -209,24 +241,28 @@ jobs:
           mv changelog-new.md changelog.md
 
           uv run \
-            --python ${{ steps.setup-python.outputs.python-version }} \
+            --python "${PYTHON_VERSION}" \
             --dev \
             prek run --files changelog.md || true
 
           git config --global user.name "github-actions"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "Changelog ${{ needs.publish-release.outputs.version }} - GHA"
-          git push origin ${{ needs.publish-release.outputs.version }}-changelog
+          git commit -am "Changelog ${VERSION} - GHA"
+          git push origin "${branch_name}"
       - name: Create pull request
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          VERSION: ${{ needs.publish-release.outputs.version }}
         with:
           script: |
             const { repo, owner } = context.repo;
+            const version = process.env.VERSION;
+            const head = `${version}-changelog`;
             const result = await github.rest.pulls.create({
-              title: 'Documentation: Add ${{ needs.publish-release.outputs.version }} changelog',
+              title: `Documentation: Add ${version} changelog`,
               owner,
               repo,
-              head: '${{ needs.publish-release.outputs.version }}-changelog',
+              head,
               base: 'main',
               body: 'This PR is auto-generated by CI.'
             });
