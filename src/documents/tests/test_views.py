@@ -27,6 +27,7 @@ from documents.models import StoragePath
 from documents.models import Tag
 from documents.signals.handlers import update_llm_suggestions_cache
 from documents.tests.utils import DirectoriesMixin
+from documents.tests.utils import read_streaming_response
 from paperless.models import ApplicationConfiguration
 
 
@@ -157,7 +158,7 @@ class TestViews(DirectoriesMixin, TestCase):
         # Valid
         response = self.client.get(f"/share/{sl1.slug}")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
         # Invalid
         response = self.client.get("/share/123notaslug", follow=True)
@@ -305,7 +306,7 @@ class TestAISuggestions(DirectoriesMixin, TestCase):
         AI_ENABLED=True,
         LLM_BACKEND="mock_backend",
     )
-    def test_suggestions_with_cached_llm(
+    def test_ai_suggestions_with_cached_llm(
         self,
         mock_refresh_cache,
         mock_get_cache,
@@ -313,7 +314,9 @@ class TestAISuggestions(DirectoriesMixin, TestCase):
         mock_get_cache.return_value = MagicMock(suggestions={"tags": ["tag1", "tag2"]})
 
         self.client.force_login(user=self.user)
-        response = self.client.get(f"/api/documents/{self.document.pk}/suggestions/")
+        response = self.client.get(
+            f"/api/documents/{self.document.pk}/ai_suggestions/",
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.json(), {"tags": ["tag1", "tag2"]})
         mock_refresh_cache.assert_called_once_with(self.document.pk)
@@ -323,7 +326,7 @@ class TestAISuggestions(DirectoriesMixin, TestCase):
         AI_ENABLED=True,
         LLM_BACKEND="mock_backend",
     )
-    def test_suggestions_with_ai_enabled(
+    def test_ai_suggestions_with_ai_enabled(
         self,
         mock_get_ai_classification,
     ) -> None:
@@ -337,7 +340,9 @@ class TestAISuggestions(DirectoriesMixin, TestCase):
         }
 
         self.client.force_login(user=self.user)
-        response = self.client.get(f"/api/documents/{self.document.pk}/suggestions/")
+        response = self.client.get(
+            f"/api/documents/{self.document.pk}/ai_suggestions/",
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
             response.json(),
@@ -353,6 +358,35 @@ class TestAISuggestions(DirectoriesMixin, TestCase):
                 "suggested_storage_paths": [],
                 "dates": ["2023-01-01"],
             },
+        )
+
+    @patch("documents.views.get_ai_document_classification")
+    @override_settings(
+        AI_ENABLED=True,
+        LLM_BACKEND="openai-like",
+    )
+    def test_ai_suggestions_with_invalid_ai_configuration(
+        self,
+        mock_get_ai_classification,
+    ) -> None:
+        mock_get_ai_classification.side_effect = ValueError(
+            "Unknown model 'gpt-5.4-mini-2026-03-17'.",
+        )
+
+        self.client.force_login(user=self.user)
+        response = self.client.get(
+            f"/api/documents/{self.document.pk}/ai_suggestions/",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "ai": ["Invalid AI configuration."],
+            },
+        )
+        self.assertIsNone(
+            get_llm_suggestion_cache(self.document.pk, backend="openai-like"),
         )
 
     def test_invalidate_suggestions_cache(self) -> None:

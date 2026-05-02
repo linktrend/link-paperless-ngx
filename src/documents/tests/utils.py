@@ -17,6 +17,7 @@ import pytest
 from django.apps import apps
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
+from django.http import StreamingHttpResponse
 from django.test import TransactionTestCase
 from django.test import override_settings
 
@@ -150,6 +151,13 @@ def util_call_with_backoff(
     return succeeded, result
 
 
+def read_streaming_response(response: StreamingHttpResponse) -> bytes:
+    """Consume a StreamingHttpResponse/FileResponse and close it."""
+    content = b"".join(response.streaming_content)
+    response.close()
+    return content
+
+
 class DirectoriesMixin:
     """
     Creates and overrides settings for all folders and paths, then ensures
@@ -176,22 +184,22 @@ class FileSystemAssertsMixin:
     Utilities for checks various state information of the file system
     """
 
-    def assertIsFile(self, path: PathLike | str) -> None:
+    def assertIsFile(self, path: PathLike[str] | str) -> None:
         self.assertTrue(Path(path).resolve().is_file(), f"File does not exist: {path}")
 
-    def assertIsNotFile(self, path: PathLike | str) -> None:
+    def assertIsNotFile(self, path: PathLike[str] | str) -> None:
         self.assertFalse(Path(path).resolve().is_file(), f"File does exist: {path}")
 
-    def assertIsDir(self, path: PathLike | str) -> None:
+    def assertIsDir(self, path: PathLike[str] | str) -> None:
         self.assertTrue(Path(path).resolve().is_dir(), f"Dir does not exist: {path}")
 
-    def assertIsNotDir(self, path: PathLike | str) -> None:
+    def assertIsNotDir(self, path: PathLike[str] | str) -> None:
         self.assertFalse(Path(path).resolve().is_dir(), f"Dir does exist: {path}")
 
     def assertFilesEqual(
         self,
-        path1: PathLike | str,
-        path2: PathLike | str,
+        path1: PathLike[str] | str,
+        path2: PathLike[str] | str,
     ) -> None:
         path1 = Path(path1)
         path2 = Path(path2)
@@ -202,7 +210,7 @@ class FileSystemAssertsMixin:
 
         self.assertEqual(hash1, hash2, "File SHA256 mismatch")
 
-    def assertFileCountInDir(self, path: PathLike | str, count: int) -> None:
+    def assertFileCountInDir(self, path: PathLike[str] | str, count: int) -> None:
         path = Path(path).resolve()
         self.assertTrue(path.is_dir(), f"Path {path} is not a directory")
         files = [x for x in path.iterdir() if x.is_file()]

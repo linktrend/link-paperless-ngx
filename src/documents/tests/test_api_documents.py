@@ -49,6 +49,7 @@ from documents.models import WorkflowTrigger
 from documents.signals.handlers import run_workflows
 from documents.tests.utils import ConsumeTaskMixin
 from documents.tests.utils import DirectoriesMixin
+from documents.tests.utils import read_streaming_response
 
 
 class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
@@ -323,19 +324,16 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
             f.write(content_thumbnail)
 
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
         response = self.client.get(f"/api/documents/{doc.pk}/preview/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
         response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content_thumbnail)
+        self.assertEqual(read_streaming_response(response), content_thumbnail)
 
     def test_document_actions_with_perms(self) -> None:
         """
@@ -386,12 +384,15 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
 
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
 
         response = self.client.get(f"/api/documents/{doc.pk}/preview/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
 
         response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
 
     @override_settings(FILENAME_FORMAT="")
     def test_download_with_archive(self) -> None:
@@ -412,28 +413,24 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
             f.write(content_archive)
 
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content_archive)
+        self.assertEqual(read_streaming_response(response), content_archive)
 
         response = self.client.get(
             f"/api/documents/{doc.pk}/download/?original=true",
         )
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
         response = self.client.get(f"/api/documents/{doc.pk}/preview/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content_archive)
+        self.assertEqual(read_streaming_response(response), content_archive)
 
         response = self.client.get(
             f"/api/documents/{doc.pk}/preview/?original=true",
         )
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
     @override_settings(FILENAME_FORMAT="")
     def test_download_follow_formatting(self) -> None:
@@ -456,18 +453,21 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
         # Without follow_formatting, should use public filename
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
         self.assertIn("none.pdf", response["Content-Disposition"])
+        response.close()
 
         # With follow_formatting, should use actual filename on disk
         response = self.client.get(
             f"/api/documents/{doc.pk}/download/?follow_formatting=true",
         )
         self.assertIn("archived.pdf", response["Content-Disposition"])
+        response.close()
 
         # With follow_formatting and original, should use source filename
         response = self.client.get(
             f"/api/documents/{doc.pk}/download/?original=true&follow_formatting=true",
         )
         self.assertIn("my_document.pdf", response["Content-Disposition"])
+        response.close()
 
     def test_document_actions_not_existing_file(self) -> None:
         doc = Document.objects.create(
@@ -1168,7 +1168,7 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
         self.assertIn("all", response.data)
         self.assertCountEqual(response.data["all"], [d.id for d in docs])
 
-    def test_default_ordering_uses_id_as_tiebreaker(self):
+    def test_default_ordering_uses_id_as_tiebreaker(self) -> None:
         """
         GIVEN:
             - Documents sharing the same created date
@@ -2145,6 +2145,29 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
         response = self.client.get("/api/documents/34676/suggestions/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    @mock.patch("documents.views.get_ai_document_classification")
+    @override_settings(AI_ENABLED=True)
+    def test_suggestions_still_uses_classifier_when_ai_enabled(
+        self,
+        mock_get_ai_classification,
+    ) -> None:
+        doc = Document.objects.create(title="test", mime_type="application/pdf")
+
+        response = self.client.get(f"/api/documents/{doc.pk}/suggestions/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data,
+            {
+                "correspondents": [],
+                "tags": [],
+                "document_types": [],
+                "storage_paths": [],
+                "dates": [],
+            },
+        )
+        mock_get_ai_classification.assert_not_called()
+
     @mock.patch("documents.views.match_storage_paths")
     @mock.patch("documents.views.match_document_types")
     @mock.patch("documents.views.match_tags")
@@ -2156,7 +2179,7 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
         match_tags,
         match_document_types,
         match_storage_paths,
-    ):
+    ) -> None:
         doc = Document.objects.create(
             title="test",
             mime_type="application/pdf",
@@ -2193,7 +2216,7 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
         match_document_types,
         match_storage_paths,
         mocked_load,
-    ):
+    ) -> None:
         """
         GIVEN:
            - Request for suggestions for a document
@@ -2276,7 +2299,7 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
     def test_get_suggestions_dates_disabled(
         self,
         mock_get_date_parser: mock.MagicMock,
-    ):
+    ) -> None:
         """
         GIVEN:
             - NUMBER_OF_SUGGESTED_DATES = 0 (disables feature)
@@ -3409,7 +3432,7 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
-    def test_create_share_link_requires_view_permission_for_document(self):
+    def test_create_share_link_requires_view_permission_for_document(self) -> None:
         """
         GIVEN:
             - A user with add_sharelink but without view permission on a document
@@ -3457,7 +3480,7 @@ class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
         self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED)
         self.assertEqual(create_resp.data["document"], doc.pk)
 
-    def test_next_asn(self):
+    def test_next_asn(self) -> None:
         """
         GIVEN:
             - Existing documents with ASNs, highest owned by user2

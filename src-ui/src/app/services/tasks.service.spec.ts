@@ -1,11 +1,19 @@
-import { provideHttpClient, withInterceptorsFromDi } from '@angular/common/http'
+import {
+  HttpRequest,
+  provideHttpClient,
+  withInterceptorsFromDi,
+} from '@angular/common/http'
 import {
   HttpTestingController,
   provideHttpClientTesting,
 } from '@angular/common/http/testing'
 import { TestBed } from '@angular/core/testing'
 import { environment } from 'src/environments/environment'
-import { PaperlessTaskStatus, PaperlessTaskType } from '../data/paperless-task'
+import {
+  PaperlessTaskStatus,
+  PaperlessTaskTriggerSource,
+  PaperlessTaskType,
+} from '../data/paperless-task'
 import { TasksService } from './tasks.service'
 
 describe('TasksService', () => {
@@ -33,16 +41,21 @@ describe('TasksService', () => {
   it('calls tasks api endpoint on reload', () => {
     tasksService.reload()
     const req = httpTestingController.expectOne(
-      `${environment.apiBaseUrl}tasks/?task_type=consume_file&acknowledged=false`
+      (req: HttpRequest<unknown>) =>
+        req.url === `${environment.apiBaseUrl}tasks/` &&
+        req.params.get('acknowledged') === 'false' &&
+        req.params.get('page_size') === '1000'
     )
     expect(req.request.method).toEqual('GET')
+    req.flush({ count: 0, results: [] })
   })
 
   it('does not call tasks api endpoint on reload if already loading', () => {
     tasksService.loading = true
     tasksService.reload()
     httpTestingController.expectNone(
-      `${environment.apiBaseUrl}tasks/?task_type=consume_file&acknowledged=false`
+      (req: HttpRequest<unknown>) =>
+        req.url === `${environment.apiBaseUrl}tasks/`
     )
   })
 
@@ -59,16 +72,20 @@ describe('TasksService', () => {
     // reload is then called
     httpTestingController
       .expectOne(
-        `${environment.apiBaseUrl}tasks/?task_type=consume_file&acknowledged=false`
+        (req: HttpRequest<unknown>) =>
+          req.url === `${environment.apiBaseUrl}tasks/` &&
+          req.params.get('acknowledged') === 'false' &&
+          req.params.get('page_size') === '1000'
       )
-      .flush([])
+      .flush({ count: 0, results: [] })
   })
 
-  it('sorts tasks returned from api', () => {
+  it('groups mixed task types by status when reloading', () => {
     expect(tasksService.total).toEqual(0)
     const mockTasks = [
       {
         task_type: PaperlessTaskType.ConsumeFile,
+        trigger_source: PaperlessTaskTriggerSource.FolderConsume,
         status: PaperlessTaskStatus.Success,
         acknowledged: false,
         task_id: '1234',
@@ -77,38 +94,42 @@ describe('TasksService', () => {
         related_document_ids: [],
       },
       {
-        task_type: PaperlessTaskType.ConsumeFile,
+        task_type: PaperlessTaskType.SanityCheck,
+        trigger_source: PaperlessTaskTriggerSource.System,
         status: PaperlessTaskStatus.Failure,
         acknowledged: false,
         task_id: '1235',
-        input_data: { filename: 'file2.pdf' },
+        input_data: {},
         date_created: new Date(),
         related_document_ids: [],
       },
       {
-        task_type: PaperlessTaskType.ConsumeFile,
+        task_type: PaperlessTaskType.MailFetch,
+        trigger_source: PaperlessTaskTriggerSource.Scheduled,
         status: PaperlessTaskStatus.Pending,
         acknowledged: false,
         task_id: '1236',
-        input_data: { filename: 'file3.pdf' },
+        input_data: {},
         date_created: new Date(),
         related_document_ids: [],
       },
       {
-        task_type: PaperlessTaskType.ConsumeFile,
+        task_type: PaperlessTaskType.LlmIndex,
+        trigger_source: PaperlessTaskTriggerSource.WebUI,
         status: PaperlessTaskStatus.Started,
         acknowledged: false,
         task_id: '1237',
-        input_data: { filename: 'file4.pdf' },
+        input_data: {},
         date_created: new Date(),
         related_document_ids: [],
       },
       {
-        task_type: PaperlessTaskType.ConsumeFile,
+        task_type: PaperlessTaskType.EmptyTrash,
+        trigger_source: PaperlessTaskTriggerSource.Manual,
         status: PaperlessTaskStatus.Success,
         acknowledged: false,
         task_id: '1238',
-        input_data: { filename: 'file5.pdf' },
+        input_data: {},
         date_created: new Date(),
         related_document_ids: [],
       },
@@ -117,16 +138,73 @@ describe('TasksService', () => {
     tasksService.reload()
 
     const req = httpTestingController.expectOne(
-      `${environment.apiBaseUrl}tasks/?task_type=consume_file&acknowledged=false`
+      (req: HttpRequest<unknown>) =>
+        req.url === `${environment.apiBaseUrl}tasks/` &&
+        req.params.get('acknowledged') === 'false' &&
+        req.params.get('page_size') === '1000'
     )
 
-    req.flush(mockTasks)
+    req.flush({ count: mockTasks.length, results: mockTasks })
 
     expect(tasksService.allFileTasks).toHaveLength(5)
     expect(tasksService.completedFileTasks).toHaveLength(2)
     expect(tasksService.failedFileTasks).toHaveLength(1)
     expect(tasksService.queuedFileTasks).toHaveLength(1)
     expect(tasksService.startedFileTasks).toHaveLength(1)
+  })
+
+  it('includes revoked tasks in needs attention', () => {
+    const mockTasks = [
+      {
+        task_type: PaperlessTaskType.SanityCheck,
+        trigger_source: PaperlessTaskTriggerSource.System,
+        status: PaperlessTaskStatus.Failure,
+        acknowledged: false,
+        task_id: '1235',
+        input_data: {},
+        date_created: new Date(),
+        related_document_ids: [],
+      },
+      {
+        task_type: PaperlessTaskType.MailFetch,
+        trigger_source: PaperlessTaskTriggerSource.Scheduled,
+        status: PaperlessTaskStatus.Revoked,
+        acknowledged: false,
+        task_id: '1236',
+        input_data: {},
+        date_created: new Date(),
+        related_document_ids: [],
+      },
+      {
+        task_type: PaperlessTaskType.EmptyTrash,
+        trigger_source: PaperlessTaskTriggerSource.Manual,
+        status: PaperlessTaskStatus.Success,
+        acknowledged: false,
+        task_id: '1238',
+        input_data: {},
+        date_created: new Date(),
+        related_document_ids: [],
+      },
+    ]
+
+    tasksService.reload()
+
+    const req = httpTestingController.expectOne(
+      (req: HttpRequest<unknown>) =>
+        req.url === `${environment.apiBaseUrl}tasks/` &&
+        req.params.get('acknowledged') === 'false' &&
+        req.params.get('page_size') === '1000'
+    )
+
+    req.flush({ count: mockTasks.length, results: mockTasks })
+
+    expect(tasksService.needsAttentionTasks).toHaveLength(2)
+    expect(tasksService.needsAttentionTasks.map((task) => task.status)).toEqual(
+      expect.arrayContaining([
+        PaperlessTaskStatus.Failure,
+        PaperlessTaskStatus.Revoked,
+      ])
+    )
   })
 
   it('supports running tasks', () => {

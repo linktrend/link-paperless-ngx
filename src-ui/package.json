@@ -1,6 +1,6 @@
 {
   "name": "paperless-ngx-ui",
-  "version": "2.20.14",
+  "version": "2.20.15",
   "scripts": {
     "preinstall": "npx only-allow pnpm",
     "ng": "ng",
@@ -36,7 +36,7 @@
     "rxjs": "^7.8.2",
     "tslib": "^2.8.1",
     "utif": "^3.1.0",
-    "uuid": "^13.0.0",
+    "uuid": "^14.0.0",
     "zone.js": "^0.16.1"
   },
   "devDependencies": {
