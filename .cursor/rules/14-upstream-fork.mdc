@@ -1,9 +1,0 @@
----
-description: "LiNKtrend fork policy"
-globs: "**/*"
-alwaysApply: false
----
-
-# Fork policy
-
-- Do not push upstream; use `linktrend/link-paperless-ngx`.

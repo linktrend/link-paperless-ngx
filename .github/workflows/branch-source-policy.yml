@@ -1,8 +1,6 @@
 name: Branch Source Policy
-
 on:
   pull_request:
-
 jobs:
   dev-branch-policy:
     runs-on: ubuntu-latest

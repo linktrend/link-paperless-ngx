@@ -2,6 +2,7 @@
 # See https://pre-commit.com/ for general information
 # See https://pre-commit.com/hooks.html for a listing of possible hooks
 # We actually run via https://github.com/j178/prek which is compatible
+exclude: "^(.agent/|.codex/|.cursor/)"
 repos:
   # General hooks
   - repo: https://github.com/pre-commit/pre-commit-hooks
